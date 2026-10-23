@@ -1,5 +1,6 @@
 # We use custom seeded UUID generation during testing
 import uuid
+from html import escape
 
 from decimal import Decimal
 from decouple import config
@@ -349,11 +350,16 @@ class Order(models.Model):
             return
         try:
             timestamp = timezone.now().replace(microsecond=0).isoformat()
+            # Escape user-controlled data (XSS in the admin's log view, fixed upstream
+            # after 0.8.7), keeping only the <b>/<i> the coordinator's own messages use.
+            safe_event = escape(str(event))
+            for tag in ("b", "i"):
+                safe_event = safe_event.replace(f"&lt;{tag}&gt;", f"<{tag}>").replace(f"&lt;/{tag}&gt;", f"</{tag}>")
             level_in_tag = "" if level == "INFO" else "<b>"
             level_out_tag = "" if level == "INFO" else "</b>"
             self.logs = (
                 self.logs
-                + f"<tr><td>{timestamp}</td><td>{level_in_tag}{level}{level_out_tag}</td><td>{event}</td></tr>"
+                + f"<tr><td>{timestamp}</td><td>{level_in_tag}{escape(str(level))}{level_out_tag}</td><td>{safe_event}</td></tr>"
             )
             self.save(update_fields=["logs"])
         except Exception:

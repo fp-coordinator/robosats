@@ -23,7 +23,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.errors import new_error
-from api.logics import Logics
+from api.logics import Logics, order_lock, withdrawable_rewards
 from api.tasks import cache_market
 from api.models import (
     Currency,
@@ -92,6 +92,15 @@ class MakerView(CreateAPIView):
 
     @extend_schema(**MakerViewSchema.post)
     def post(self, request):
+        # One make at a time per robot: closes the check-then-create race between
+        # validate_already_maker_or_taker and order.save() (fixed upstream after 0.8.7).
+        robot = getattr(request.user, "robot", None)
+        if not request.user.is_authenticated or robot is None:
+            return Response(new_error(1036), status.HTTP_400_BAD_REQUEST)
+        with order_lock(robot.pk, space=7392):
+            return self._post(request)
+
+    def _post(self, request):
         serializer = self.serializer_class(data=request.data)
 
         if not request.user.is_authenticated:
@@ -521,14 +530,30 @@ class OrderView(viewsets.ViewSet):
         """
         Here takes place all of the updates to the order object.
         That is: take, confim, cancel, dispute, update_invoice or rate.
+
+        Every action runs holding the order's lock (Logics.order_lock), so
+        concurrent requests on the same order (e.g. several simultaneous
+        'cancel' or 'confirm') are serialized: the second one waits and then
+        sees the state left by the first one. Requires PostgreSQL.
         """
+        try:
+            order_id = int(request.GET.get(self.lookup_url_kwarg))
+        except (ValueError, TypeError):
+            return Response(new_error(1042), status.HTTP_404_NOT_FOUND)
+        with order_lock(order_id):
+            return self._take_update_confirm_dispute_cancel(request)
+
+    def _take_update_confirm_dispute_cancel(self, request):
         order_id = request.GET.get(self.lookup_url_kwarg)
 
         serializer = UpdateOrderSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(status=status.HTTP_400_BAD_REQUEST)
 
-        order = Order.objects.get(id=order_id)
+        try:
+            order = Order.objects.get(id=order_id)
+        except (Order.DoesNotExist, ValueError, TypeError):
+            return Response(new_error(1042), status.HTTP_404_NOT_FOUND)
 
         # action is either 1)'take', 2)'confirm', 2.b)'undo_confirm', 3)'cancel', 4)'dispute' , 5)'update_invoice'
         # 5.b)'update_address' 6)'submit_statement' (in dispute), 7)'rate_user' , 8)'rate_platform'
@@ -545,28 +570,34 @@ class OrderView(viewsets.ViewSet):
         # 1) If action is take, it is a taker request!
         if action == "take":
             if order.status == Order.Status.PUB:
-                valid, context, _ = Logics.validate_already_maker_or_taker(request.user)
-                if not valid:
-                    return Response(context, status=status.HTTP_409_CONFLICT)
-
-                if order.password is not None:
-                    if password is None or not compare_digest(order.password, password):
-                        return Response(
-                            new_error(1045), status=status.HTTP_403_FORBIDDEN
-                        )
-
-                # For order with amount range, set the amount now.
-                if order.has_range:
-                    amount = float(serializer.data.get("amount"))
-                    valid, context = Logics.validate_amount_within_range(order, amount)
+                # Lock the robot too, so the same robot can't take two orders at
+                # once (check-then-create race, fixed upstream with a robot row lock).
+                robot = getattr(request.user, "robot", None)
+                if robot is None:
+                    return Response(new_error(1036), status.HTTP_400_BAD_REQUEST)
+                with order_lock(robot.pk, space=7392):
+                    valid, context, _ = Logics.validate_already_maker_or_taker(request.user)
                     if not valid:
-                        return Response(context, status=status.HTTP_400_BAD_REQUEST)
+                        return Response(context, status=status.HTTP_409_CONFLICT)
 
-                    valid, context = Logics.take(order, request.user, amount)
-                else:
-                    valid, context = Logics.take(order, request.user)
-                if not valid:
-                    return Response(context, status=status.HTTP_403_FORBIDDEN)
+                    if order.password is not None:
+                        if password is None or not compare_digest(order.password, password):
+                            return Response(
+                                new_error(1045), status=status.HTTP_403_FORBIDDEN
+                            )
+
+                    # For order with amount range, set the amount now.
+                    if order.has_range:
+                        amount = float(serializer.data.get("amount"))
+                        valid, context = Logics.validate_amount_within_range(order, amount)
+                        if not valid:
+                            return Response(context, status=status.HTTP_400_BAD_REQUEST)
+
+                        valid, context = Logics.take(order, request.user, amount)
+                    else:
+                        valid, context = Logics.take(order, request.user)
+                    if not valid:
+                        return Response(context, status=status.HTTP_403_FORBIDDEN)
 
                 return self.get(request)
 
@@ -688,7 +719,7 @@ class RobotView(APIView):
         context["hash_id"] = user.robot.hash_id
         context["public_key"] = user.robot.public_key
         context["encrypted_private_key"] = user.robot.encrypted_private_key
-        context["earned_rewards"] = user.robot.earned_rewards
+        context["earned_rewards"] = withdrawable_rewards(user.robot)
         context["wants_stealth"] = user.robot.wants_stealth
         context["nostr_pubkey"] = user.robot.nostr_pubkey
 

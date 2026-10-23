@@ -6,7 +6,7 @@ from django.core.management.base import BaseCommand
 from django.utils import timezone
 
 from api.lightning.node import LNNode
-from api.logics import Logics
+from api.logics import Logics, order_lock
 from api.models import LNPayment, OnchainPayment, Order
 from api.tasks import follow_send_payment, send_notification
 
@@ -218,6 +218,19 @@ class Command(BaseCommand):
                 )
 
     def update_order_status(self, lnpayment):
+        """Runs the order transition below holding the order's lock, so it can't
+        interleave with a user action on the same order (e.g. a maker cancel while
+        the taker bond is being locked)."""
+        take = getattr(lnpayment, "take_order", None)
+        order = (getattr(lnpayment, "order_made", None) or getattr(lnpayment, "order_escrow", None)
+                 or getattr(lnpayment, "order_taken", None) or (take.order if take else None))
+        if order is None:
+            return self._update_order_status(lnpayment)
+        with order_lock(order.pk):
+            order.refresh_from_db()
+            return self._update_order_status(lnpayment)
+
+    def _update_order_status(self, lnpayment):
         """Background process following LND hold invoices
         can catch LNpayments changing status. If they do,
         the order status might have to change too."""

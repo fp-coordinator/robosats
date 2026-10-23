@@ -1,6 +1,8 @@
 from statistics import median
 
 from django.contrib import admin, messages
+from django.db import connection, transaction
+from django.db.models import F
 from django.contrib.auth.admin import UserAdmin
 from django.contrib.auth.models import Group, User
 from django.utils.html import format_html
@@ -8,7 +10,7 @@ from django_admin_relation_links import AdminChangeLinksMixin
 from rest_framework.authtoken.admin import TokenAdmin
 from rest_framework.authtoken.models import TokenProxy
 
-from api.logics import Logics
+from api.logics import Logics, ledger_add, ledger_backed, ledger_credit
 from api.models import Currency, LNPayment, MarketTick, OnchainPayment, Order, Robot
 from api.utils import objects_to_hyperlinks
 from api.tasks import send_notification
@@ -17,6 +19,36 @@ admin.site.unregister(Group)
 admin.site.unregister(User)
 admin.site.unregister(TokenProxy)
 
+
+
+def _credit(robot, sats, order, what):
+    """Adds sats to a robot's compensations atomically (never overwrites), once per
+    order, robot and item: recorded in the reward ledger so they can be withdrawn."""
+    ledger_credit(
+        robot,
+        sats,
+        "admin",
+        f"admin:{order.id}:{robot.pk}:{what}",
+        order_id=order.id,
+        note=what,
+    )
+
+
+def _lock_disputed(order):
+    """Re-reads the order under a row lock; None if it's no longer in dispute."""
+    # Also the order's advisory lock (Logics.order_lock, same key), held until the
+    # admin action's transaction ends, so it can't interleave with a user action.
+    with connection.cursor() as c:
+        c.execute("SELECT pg_advisory_xact_lock(%s, %s)", [7391, int(order.pk)])
+    order = Order.objects.select_for_update().get(pk=order.pk)
+    if not (order.status in [Order.Status.DIS, Order.Status.WFR] and order.is_disputed):
+        return None
+    # The automatic resolution ("nobody wrote in the chat") returns the escrow
+    # to the seller but leaves the order in DIS: crediting the escrow again
+    # here would pay it twice. Only resolve disputes whose escrow we hold.
+    if not (order.trade_escrow and order.trade_escrow.status == LNPayment.Status.SETLED):
+        return None
+    return order
 
 class RobotInline(admin.StackedInline):
     model = Robot
@@ -182,16 +214,16 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
                 )
 
     @admin.action(description="Solve dispute: maker wins")
+    @transaction.atomic
     def maker_wins(self, request, queryset):
         """
         Solves a dispute on favor of the maker.
         Adds Sats to compensations (earned_rewards) of the maker robot.
         """
         for order in queryset:
-            if (
-                order.status in [Order.Status.DIS, Order.Status.WFR]
-                and order.is_disputed
-            ):
+            locked = _lock_disputed(order)
+            if locked is not None:
+                order = locked
                 own_bond_sats = order.maker_bond.num_satoshis
                 if Logics.is_buyer(order, order.maker):
                     if order.is_swap:
@@ -201,8 +233,7 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
                 else:
                     trade_sats = order.trade_escrow.num_satoshis
 
-                order.maker.robot.earned_rewards = own_bond_sats + trade_sats
-                order.maker.robot.save(update_fields=["earned_rewards"])
+                _credit(order.maker.robot, own_bond_sats + trade_sats, order, "maker_wins")
                 order.update_status(Order.Status.TLD)
 
                 self.message_user(
@@ -215,21 +246,21 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
             else:
                 self.message_user(
                     request,
-                    f"Order {order.id} is not in a disputed state",
+                    f"Order {order.id} is not in a disputed state, or its escrow is not settled",
                     messages.ERROR,
                 )
 
     @admin.action(description="Solve dispute: taker wins")
+    @transaction.atomic
     def taker_wins(self, request, queryset):
         """
         Solves a dispute on favor of the taker.
         Adds Sats to compensations (earned_rewards) of the taker robot.
         """
         for order in queryset:
-            if (
-                order.status in [Order.Status.DIS, Order.Status.WFR]
-                and order.is_disputed
-            ):
+            locked = _lock_disputed(order)
+            if locked is not None:
+                order = locked
                 own_bond_sats = order.taker_bond.num_satoshis
                 if Logics.is_buyer(order, order.taker):
                     if order.is_swap:
@@ -239,8 +270,7 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
                 else:
                     trade_sats = order.trade_escrow.num_satoshis
 
-                order.taker.robot.earned_rewards = own_bond_sats + trade_sats
-                order.taker.robot.save(update_fields=["earned_rewards"])
+                _credit(order.taker.robot, own_bond_sats + trade_sats, order, "taker_wins")
 
                 order.update_status(Order.Status.MLD)
 
@@ -254,34 +284,28 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
             else:
                 self.message_user(
                     request,
-                    f"Order {order.id} is not in a disputed state",
+                    f"Order {order.id} is not in a disputed state, or its escrow is not settled",
                     messages.ERROR,
                 )
 
     @admin.action(description="Solve dispute: return everything")
+    @transaction.atomic
     def return_everything(self, request, queryset):
         """
         Solves a dispute by pushing back every bond and escrow to their sender.
         """
         for order in queryset:
-            if (
-                order.status in [Order.Status.DIS, Order.Status.WFR]
-                and order.is_disputed
-            ):
-                order.maker_bond.sender.robot.earned_rewards += (
-                    order.maker_bond.num_satoshis
+            locked = _lock_disputed(order)
+            if locked is not None:
+                order = locked
+                _credit(order.maker_bond.sender.robot, order.maker_bond.num_satoshis, order, "maker_bond")
+                _credit(order.taker_bond.sender.robot, order.taker_bond.num_satoshis, order, "taker_bond")
+                _credit(
+                    order.trade_escrow.sender.robot,
+                    order.trade_escrow.num_satoshis,
+                    order,
+                    "escrow",
                 )
-                order.maker_bond.sender.robot.save(update_fields=["earned_rewards"])
-
-                order.taker_bond.sender.robot.earned_rewards += (
-                    order.taker_bond.num_satoshis
-                )
-
-                order.taker_bond.sender.robot.save(update_fields=["earned_rewards"])
-                order.trade_escrow.sender.robot.earned_rewards += (
-                    order.trade_escrow.num_satoshis
-                )
-                order.trade_escrow.sender.robot.save(update_fields=["earned_rewards"])
 
                 order.update_status(Order.Status.CCA)
 
@@ -294,25 +318,23 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
             else:
                 self.message_user(
                     request,
-                    f"Order {order.id} is not in a disputed state",
+                    f"Order {order.id} is not in a disputed state, or its escrow is not settled",
                     messages.ERROR,
                 )
 
     @admin.action(description="Solve dispute: successful trade")
+    @transaction.atomic
     def successful_trade(self, request, queryset):
         """
         Solves a dispute as if the trade had been successful, i.e.,
         returns both bonds (added as compensations) and triggers the payout.
         """
         for order in queryset:
-            if (
-                order.status in [Order.Status.DIS, Order.Status.WFR]
-                and order.is_disputed
-            ):
-                order.maker.robot.earned_rewards = order.maker_bond.num_satoshis
-                order.maker.robot.save(update_fields=["earned_rewards"])
-                order.taker.robot.earned_rewards = order.taker_bond.num_satoshis
-                order.taker.robot.save(update_fields=["earned_rewards"])
+            locked = _lock_disputed(order)
+            if locked is not None:
+                order = locked
+                _credit(order.maker.robot, order.maker_bond.num_satoshis, order, "maker_bond")
+                _credit(order.taker.robot, order.taker_bond.num_satoshis, order, "taker_bond")
 
                 if order.is_swap:
                     order.payout_tx.status = OnchainPayment.Status.VALID
@@ -332,7 +354,7 @@ class OrderAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
             else:
                 self.message_user(
                     request,
-                    f"Order {order.id} is not in a disputed state",
+                    f"Order {order.id} is not in a disputed state, or its escrow is not settled",
                     messages.ERROR,
                 )
 
@@ -513,11 +535,36 @@ class UserRobotAdmin(AdminChangeLinksMixin, admin.ModelAdmin):
         "lost_disputes",
     )
     raw_id_fields = ("user",)
-    list_editable = ["earned_rewards"]
+    # earned_rewards is NOT editable from the list: saving the page would
+    # write back a stale balance (e.g. re-credit sats already withdrawn).
     list_display_links = ["id"]
     change_links = ["user"]
     search_fields = ["user__username", "id"]
     readonly_fields = ("hash_id", "public_key", "encrypted_private_key")
+    actions = ["back_balance_in_ledger"]
+
+    @admin.action(description="Back the current reward balance in the ledger")
+    def back_balance_in_ledger(self, request, queryset):
+        """Only rewards recorded in the ledger can be withdrawn. After crediting a
+        robot by hand (editing earned_rewards), this records the difference, so it
+        is a deliberate, logged step."""
+        for robot in queryset:
+            robot.refresh_from_db(fields=["earned_rewards"])
+            backed, waiting = ledger_backed(robot.pk)
+            missing = robot.earned_rewards - backed - waiting
+            if missing <= 0:
+                self.message_user(request, f"Robot {robot.pk}: nothing to back", messages.INFO)
+                continue
+            ledger_add(
+                robot.pk,
+                missing,
+                "manual",
+                f"manual:{robot.pk}:{backed + waiting}:{robot.earned_rewards}",
+                note=f"backed by admin {request.user.username}",
+            )
+            self.message_user(
+                request, f"Robot {robot.pk}: {missing} Sats backed in the ledger", messages.SUCCESS
+            )
 
 
 @admin.register(Currency)
