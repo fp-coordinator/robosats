@@ -1,6 +1,7 @@
 # We use custom seeded UUID generation during testing
 import json
 import uuid
+from html import escape
 
 from decimal import Decimal
 from decouple import config

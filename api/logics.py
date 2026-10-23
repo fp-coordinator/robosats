@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager
 from datetime import timedelta
 
 from decouple import config, Csv
@@ -6,7 +7,7 @@ from django.contrib.auth.models import User
 from django.db.models import F, Q, Sum
 from django.utils import timezone
 from django.utils.html import format_html
-from django.db import transaction
+from django.db import connection, transaction
 
 from api.lightning.node import LNNode
 from api.errors import new_error
@@ -68,6 +69,144 @@ def payout_problem(lnpayment):
     except Exception as e:
         return f"could not check the escrow in the lightning node ({e})"
     return None
+
+
+@contextmanager
+def order_lock(order_id, space=7391):
+    """Serializes everything done to one order (user actions and expiry) with a
+    PostgreSQL session advisory lock. Unlike select_for_update it needs no
+    surrounding transaction, so each step is still committed as it happens: a
+    payment already sent can never be rolled back in the database by an error
+    later in the same request. Re-entrant within one connection, and released
+    by PostgreSQL if the process dies. space=7392 is used for robots."""
+    with connection.cursor() as c:
+        c.execute("SELECT pg_advisory_lock(%s, %s)", [space, int(order_id)])
+    try:
+        yield
+    finally:
+        with connection.cursor() as c:
+            c.execute("SELECT pg_advisory_unlock(%s, %s)", [space, int(order_id)])
+
+
+# Reward ledger (23 oct 2026). Robot.earned_rewards is only a cached number: any bug
+# that inflates it (the concurrent-cancel exploit did) used to be withdrawable as is.
+# Every credit and withdrawal is now also an append-only row with a unique
+# fingerprint, so the same bond can never be credited twice whatever the request
+# interleaving, and a withdrawal pays at most what the ledger backs.
+LEDGER_TABLE = "coord_reward_ledger"
+_ledger_ready = False
+
+
+def ensure_ledger():
+    """Creates the ledger the first time. Balances that already exist then are
+    recorded once as 'opening' rows; nothing else is ever backed implicitly."""
+    global _ledger_ready
+    if _ledger_ready:
+        return
+    with transaction.atomic(), connection.cursor() as c:
+        c.execute("SELECT pg_advisory_xact_lock(7393, 0)")
+        c.execute("SELECT to_regclass(%s)", [LEDGER_TABLE])
+        if c.fetchone()[0] is None:
+            c.execute(
+                f"""
+                CREATE TABLE {LEDGER_TABLE} (
+                    id bigserial PRIMARY KEY,
+                    robot_id integer NOT NULL,
+                    order_id integer,
+                    kind text NOT NULL,
+                    amount bigint NOT NULL,
+                    fingerprint text NOT NULL UNIQUE,
+                    created_at timestamptz NOT NULL DEFAULT now(),
+                    available_at timestamptz NOT NULL DEFAULT now(),
+                    note text NOT NULL DEFAULT ''
+                );
+                CREATE INDEX {LEDGER_TABLE}_robot ON {LEDGER_TABLE} (robot_id);
+                CREATE FUNCTION {LEDGER_TABLE}_append_only() RETURNS trigger AS $$
+                BEGIN RAISE EXCEPTION '{LEDGER_TABLE} is append-only'; END
+                $$ LANGUAGE plpgsql;
+                CREATE TRIGGER {LEDGER_TABLE}_no_change BEFORE UPDATE OR DELETE
+                    ON {LEDGER_TABLE} FOR EACH ROW
+                    EXECUTE FUNCTION {LEDGER_TABLE}_append_only();
+                CREATE TRIGGER {LEDGER_TABLE}_no_truncate BEFORE TRUNCATE
+                    ON {LEDGER_TABLE} FOR EACH STATEMENT
+                    EXECUTE FUNCTION {LEDGER_TABLE}_append_only();
+                INSERT INTO {LEDGER_TABLE} (robot_id, kind, amount, fingerprint, note)
+                    SELECT id, 'opening', earned_rewards, 'opening:' || id,
+                           'balance when the ledger was created'
+                    FROM api_robot WHERE earned_rewards > 0;
+                """
+            )
+    _ledger_ready = True
+
+
+def ledger_add(robot_id, amount, kind, fingerprint, order_id=None, note="", delay=0):
+    """Appends one row; False if the fingerprint is already there (nothing written)."""
+    ensure_ledger()
+    with connection.cursor() as c:
+        c.execute(
+            f"""INSERT INTO {LEDGER_TABLE}
+                (robot_id, order_id, kind, amount, fingerprint, note, available_at)
+                VALUES (%s, %s, %s, %s, %s, %s, now() + make_interval(secs => %s))
+                ON CONFLICT (fingerprint) DO NOTHING RETURNING id""",
+            [robot_id, order_id, kind, int(amount), fingerprint, note, int(delay)],
+        )
+        return c.fetchone() is not None
+
+
+def ledger_credit(robot, amount, kind, fingerprint, order_id=None, note=""):
+    """Credits a reward once per fingerprint: ledger row and balance together."""
+    delay = config("REWARD_WITHDRAW_DELAY", cast=int, default=0)
+    with transaction.atomic():
+        if not ledger_add(robot.pk, amount, kind, fingerprint, order_id, note, delay):
+            return False
+        Robot.objects.filter(pk=robot.pk).update(
+            earned_rewards=F("earned_rewards") + int(amount)
+        )
+    return True
+
+
+def ledger_backed(robot_id):
+    """(withdrawable now, still waiting) according to the ledger."""
+    ensure_ledger()
+    with connection.cursor() as c:
+        c.execute(
+            f"""SELECT COALESCE(SUM(amount) FILTER (WHERE available_at <= now()), 0),
+                       COALESCE(SUM(amount) FILTER (WHERE available_at > now()), 0)
+                FROM {LEDGER_TABLE} WHERE robot_id = %s""",
+            [robot_id],
+        )
+        now, waiting = c.fetchone()
+    return int(now), int(waiting)
+
+
+def ledger_withdrawn_24h(robot_id):
+    ensure_ledger()
+    with connection.cursor() as c:
+        c.execute(
+            f"""SELECT COALESCE(-SUM(amount), 0) FROM {LEDGER_TABLE}
+                WHERE robot_id = %s AND kind IN ('withdraw', 'withdraw_refund')
+                AND created_at > now() - interval '24 hours'""",
+            [robot_id],
+        )
+        return int(c.fetchone()[0])
+
+
+def withdrawable_rewards(robot):
+    """What a robot can withdraw now: its balance, capped by the ledger (only rows
+    already available) and by REWARD_WITHDRAW_DAILY_MAX. Also shown in the app, so
+    the invoice the user makes matches what will be paid."""
+    backed, waiting = ledger_backed(robot.pk)
+    sats = min(robot.earned_rewards, backed)
+    if robot.earned_rewards > backed + waiting:
+        print(
+            f"REWARD LEDGER MISMATCH Robot({robot.pk}) balance "
+            f"{robot.earned_rewards} > ledger {backed + waiting}",
+            flush=True,
+        )
+    daily_max = config("REWARD_WITHDRAW_DAILY_MAX", cast=int, default=0)
+    if daily_max:
+        sats = min(sats, daily_max - ledger_withdrawn_24h(robot.pk))
+    return max(int(sats), 0)
 
 
 class Logics:
@@ -303,7 +442,18 @@ class Logics:
 
     @classmethod
     def order_expires(cls, order):
-        """General cases when time runs out."""
+        """General cases when time runs out.
+
+        Runs under the order's lock (order_lock) so it can't interleave with a user
+        action (cancel, confirm...) on the same order: otherwise a cancel sent
+        right at the expiry time could slash and reward twice.
+        """
+        with order_lock(order.pk):
+            order.refresh_from_db()
+            return cls._order_expires_locked(order)
+
+    @classmethod
+    def _order_expires_locked(cls, order):
 
         # Do not change order status if an order in any with
         # any of these status is sent to expire here
@@ -1551,7 +1701,11 @@ class Logics:
         }
 
     def settle_escrow(order):
-        """Settles the trade escrow hold invoice"""
+        """Settles the trade escrow hold invoice. Like settle_bond, True only the
+        first time: LND reports success again on an already settled invoice."""
+        order.trade_escrow.refresh_from_db(fields=["status"])
+        if order.trade_escrow.status == LNPayment.Status.SETLED:
+            return False
         if LNNode.settle_hold_invoice(order.trade_escrow.preimage):
             order.trade_escrow.status = LNPayment.Status.SETLED
             order.trade_escrow.save(update_fields=["status"])
@@ -1559,7 +1713,15 @@ class Logics:
             return True
 
     def settle_bond(bond):
-        """Settles the bond hold invoice"""
+        """Settles the bond hold invoice.
+
+        Returns True only the first time: settling an already settled hold
+        invoice succeeds in LND, so without this guard a repeated call would
+        be reported as a new slash and rewards would be credited again.
+        """
+        bond.refresh_from_db(fields=["status"])
+        if bond.status == LNPayment.Status.SETLED:
+            return False
         if LNNode.settle_hold_invoice(bond.preimage):
             bond.status = LNPayment.Status.SETLED
             bond.save(update_fields=["status"])
@@ -1842,41 +2004,47 @@ class Logics:
 
         reward = int(slashed_satoshis * reward_fraction)
         rewarded_robot = staked_bond.sender.robot
-        problem = cls.reward_source_problem(order, slashed_bond, staked_bond, reward)
-        if problem:
+        # One credit per slashed bond, enforced by the ledger's unique fingerprint: a
+        # second call for the same bond (concurrent cancels, retries) credits nothing,
+        # and neither proceeds nor the devfund donation are counted again.
+        if not ledger_credit(
+            rewarded_robot,
+            reward,
+            "slash_reward",
+            f"slash_reward:{order.id}:{slashed_bond.payment_hash}",
+            order_id=order.id,
+        ):
             order.log(
-                f"Reward for slashed bond {slashed_bond.payment_hash} NOT CREDITED: {problem}",
+                f"Slashed bond {slashed_bond.payment_hash} was already rewarded: DUPLICATE CREDIT REFUSED",
                 level="WARN",
             )
             return
-        new_proceeds = int(slashed_satoshis * (1 - reward_fraction))
+
         slashed_robot_log = ""
-        with transaction.atomic():
-            # Only the call that marks the bond as rewarded credits it: a second call
-            # for the same bond (concurrent cancels, retries) finds it already marked.
-            claimed = LNPayment.objects.filter(
-                pk=slashed_bond.pk, rewarded_at__isnull=True
-            ).update(rewarded_at=timezone.now())
-            if not claimed:
-                order.log(
-                    f"Reward for slashed bond {slashed_bond.payment_hash} NOT CREDITED: already rewarded",
-                    level="WARN",
-                )
-                return
-            Robot.objects.filter(pk=rewarded_robot.pk).update(
-                earned_rewards=F("earned_rewards") + reward
+        # The coordinator may hold big returns for review instead of crediting them (22 oct
+        # 2026: the exploit lived on these, a bond far bigger than the take, cancelled at
+        # once). Held sats stay with the coordinator; an admin credits them if legitimate.
+        hold_above = config("HOLD_SLASHED_RETURN_ABOVE", cast=int, default=0)
+        if slashed_return > 100 and hold_above and slashed_return > hold_above:
+            slashed_robot = slashed_bond.sender.robot
+            slashed_robot_log = f"Robot({slashed_robot.id},{slashed_robot.user.username}) return of {slashed_return} Sats HELD FOR REVIEW"
+        elif slashed_return > 100:
+            slashed_robot = slashed_bond.sender.robot
+            ledger_credit(
+                slashed_robot,
+                slashed_return,
+                "slash_return",
+                f"slash_return:{order.id}:{slashed_bond.payment_hash}",
+                order_id=order.id,
             )
-            if slashed_return > 100:
-                slashed_robot = slashed_bond.sender.robot
-                Robot.objects.filter(pk=slashed_robot.pk).update(
-                    earned_rewards=F("earned_rewards") + slashed_return
-                )
-                slashed_robot_log = f"Robot({slashed_robot.id},{slashed_robot.user.username}) was returned {slashed_return} Sats)"
-            Order.objects.filter(pk=order.pk).update(
-                proceeds=F("proceeds") + new_proceeds
-            )
+            slashed_robot_log = f"Robot({slashed_robot.id},{slashed_robot.user.username}) was returned {slashed_return} Sats)"
+
+        new_proceeds = int(slashed_satoshis * (1 - reward_fraction))
+        Order.objects.filter(pk=order.pk).update(proceeds=F("proceeds") + new_proceeds)
         order.refresh_from_db(fields=["proceeds"])
-        send_devfund_donation.delay(order.id, new_proceeds, "slashed bond")
+        transaction.on_commit(
+            lambda: send_devfund_donation.delay(order.id, new_proceeds, "slashed bond")
+        )
         order.log(
             f"Robot({rewarded_robot.id},{rewarded_robot.user.username}) was rewarded {reward} Sats. {slashed_robot_log}"
         )
@@ -1892,7 +2060,15 @@ class Logics:
             if user.robot.earned_rewards < 1:
                 return False, new_error(3003)
 
-            num_satoshis = user.robot.earned_rewards
+            # Pay at most what the ledger backs and has already become available, and
+            # at most REWARD_WITHDRAW_DAILY_MAX per robot and day. A balance bigger
+            # than its ledger (inflated by some bug) is never paid beyond the ledger.
+            num_satoshis = withdrawable_rewards(user.robot)
+            if num_satoshis < 1:
+                return False, {
+                    "bad_invoice": "Your rewards are not available for withdrawal yet. Try again later."
+                }
+            withdrawn_balance = num_satoshis
 
             # Optional limits on what leaves as rewards, whatever inflated a balance:
             # one withdrawal per robot every REWARD_WITHDRAW_COOLDOWN seconds, and at
@@ -1969,6 +2145,17 @@ class Logics:
             if not reward_payout["valid"]:
                 return False, reward_payout["context"]
 
+            # Nodes that rewards are never paid to (the coordinator's blocklist, e.g. the
+            # nodes of a known exploit): the balance stays with the coordinator.
+            blocked = config("BLOCKED_PAYOUT_NODES", cast=Csv(), default="")
+            if blocked:
+                try:
+                    destination = LNNode.decode_payreq(invoice).destination
+                except Exception:
+                    destination = None
+                if destination in blocked:
+                    return False, {"bad_invoice": "Invalid invoice"}
+
             try:
                 with transaction.atomic():
                     lnpayment = LNPayment.objects.create(
@@ -1987,15 +2174,25 @@ class Logics:
             except Exception:
                 return False, new_error(3004)
 
-            user.robot.earned_rewards = 0
-            user.robot.save(update_fields=["earned_rewards"])
+            if not ledger_add(
+                user.robot.pk,
+                -withdrawn_balance,
+                "withdraw",
+                f"withdraw:{lnpayment.payment_hash}",
+            ):
+                return False, new_error(3004)
+
+            # Take exactly the withdrawn balance out (credits that arrive while
+            # the payment is in flight are kept, not wiped).
+            Robot.objects.filter(pk=user.robot.pk).update(
+                earned_rewards=F("earned_rewards") - withdrawn_balance
+            )
 
         # Pays the invoice.
         paid, failure_reason = LNNode.pay_invoice(lnpayment)
         if paid:
             Robot.objects.filter(pk=user.robot.pk).update(
-                earned_rewards=0,
-                claimed_rewards=F("claimed_rewards") + num_satoshis,
+                claimed_rewards=F("claimed_rewards") + num_satoshis
             )
             return True, None
 
@@ -2010,8 +2207,11 @@ class Logics:
         # stays in the DB; a retry with the same invoice is blocked by the duplicate-
         # hash guard above (error 3004) until the hash is resolved or expires.
         if lnpayment.status == LNPayment.Status.FAILRO:
-            Robot.objects.filter(pk=user.robot.pk).update(
-                earned_rewards=num_satoshis,
+            ledger_credit(
+                user.robot,
+                withdrawn_balance,
+                "withdraw_refund",
+                f"withdraw_refund:{lnpayment.payment_hash}",
             )
             return False, new_error(3005, {"failure_reason": failure_reason})
 

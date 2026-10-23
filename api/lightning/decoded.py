@@ -38,3 +38,4 @@ class DecodedPayReq:
     expiry: int
     description: str
     route_hints: list = field(default_factory=list)  # list[list[HopHint]]
+    features: frozenset = field(default_factory=frozenset)  # set of feature-bit ints

@@ -118,6 +118,10 @@ class LNDNode:
             ]
             route_hints.append(hops)
 
+        # LND's DecodePayReq response has a map<uint32, Feature> features field;
+        # keys are the integer feature-bit numbers (e.g. 30/31 for AMP invoices).
+        features = frozenset(response.features.keys())
+
         return DecodedPayReq(
             num_satoshis=response.num_satoshis,
             payment_hash=response.payment_hash,
@@ -125,6 +129,7 @@ class LNDNode:
             expiry=response.expiry,
             description=response.description,
             route_hints=route_hints,
+            features=features,
         )
 
     @classmethod
@@ -352,7 +357,10 @@ class LNDNode:
                     f"than invoice value {expected_msat} msat. "
                     f"Cancelling invoice immediately."
                 )
-                cls.cancel_return_hold_invoice(lnpayment.payment_hash)
+                try:
+                    cls.cancel_return_hold_invoice(lnpayment.payment_hash)
+                except Exception as e:
+                    print(f"ERROR: could not cancel hold invoice {lnpayment.payment_hash}: {e}")
                 lnpayment.status = LNPayment.Status.CANCEL
                 lnpayment.save(update_fields=["status"])
                 return False
@@ -505,6 +513,14 @@ class LNDNode:
                 }
                 return payout
 
+        # AMP invoices are reusable: every new send gets a fresh SetID and LND
+        # does not dedupe it, so a retry would pay the same invoice again.
+        if 30 in payreq_decoded.features or 31 in payreq_decoded.features:
+            payout["context"] = {
+                "bad_invoice": "AMP invoices are not supported, use a regular invoice"
+            }
+            return payout
+
         if payreq_decoded.num_satoshis == 0:
             payout["context"] = {
                 "bad_invoice": "The invoice provided has no explicit amount"
@@ -555,7 +571,6 @@ class LNDNode:
             payment_request=lnpayment.invoice,
             fee_limit_sat=fee_limit_sat,
             timeout_seconds=timeout_seconds,
-            amp=True,
         )
 
         routerstub = router_pb2_grpc.RouterStub(cls.channel)
@@ -614,7 +629,6 @@ class LNDNode:
             fee_limit_sat=fee_limit_sat,
             timeout_seconds=timeout_seconds,
             allow_self_payment=True,
-            amp=True,
         )
 
         order = lnpayment.order_paid_LN
