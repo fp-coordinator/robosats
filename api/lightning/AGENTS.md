@@ -33,8 +33,9 @@ class-definition time (also import time), reused by every call.
   vendor. Self-keysend (`ALLOW_SELF_KEYSEND` env) is **LND-only**; CLN's request has no such
   field and the env read is commented out (`# Cannot perform selfpayments`).
 - `pay_onchain(cls, onchainpayment, queue_code=5, on_mempool_code=2)` — first arg is an
-  `OnchainPayment` **object**. Flips status from `queue_code` to `on_mempool_code`
-  *before* broadcasting.
+  `OnchainPayment` **object**. Calls the RPC first; only writes `on_mempool_code` to DB
+  after a successful response. If the RPC raises, status stays `queue_code` so
+  `follow_invoices` retries naturally.
 - `estimate_fee(cls, amount_sats, target_conf=2, min_confs=1)` → `{mining_fee_sats,
   mining_fee_rate}`. LND actually uses `target_conf`/`min_confs` against a dummy/burn
   address; CLN accepts but ignores both, using a fixed ~12-block "opening channel" bucket.
@@ -131,7 +132,7 @@ no longer exists and raises `AttributeError` at runtime if referenced.
 Keep LND and CLN method signatures in lockstep — `node.py`'s aliasing assumes identical
 call signatures on both classes. Never call vendor gRPC stubs directly from `api/` —
 always go through `LNNode`. Don't assume `CONFI` is reachable; anything gating on it will
-never fire. Treat `pay_onchain`/broadcast code as irreversible once past the `MEMPO` flip.
+never fire. Treat `pay_onchain`/broadcast code as irreversible once `MEMPO` is written to DB (which now only happens after a confirmed RPC response).
 **Before upgrading CLN, check holdinvoice compatibility** — holdinvoice v4.0.0 supports
 CLN up to v25.09.x only. Upgrading CLN beyond the holdinvoice-supported range will silently
 break all hold invoice locking.

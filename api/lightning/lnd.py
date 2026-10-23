@@ -187,24 +187,26 @@ class LNDNode:
             time.sleep(3 + delay)
 
         if onchainpayment.status == queue_code:
-            # Changing the state to "MEMPO" should be atomic with SendCoins.
-            onchainpayment.status = on_mempool_code
-            onchainpayment.save(update_fields=["status"])
             lightningstub = lightning_pb2_grpc.LightningStub(cls.channel)
             response = lightningstub.SendCoins(request)
             log("lightning_pb2_grpc.SendCoins", request, response)
-
+            # RPC succeeded: write status, txid, and broadcasted in a single save.
+            # If SendCoins raised above, status stays QUEUE so follow_invoices'
+            # existing scanner retries naturally without any new retry logic here.
+            onchainpayment.status = on_mempool_code
             if response.txid:
                 onchainpayment.txid = response.txid
                 onchainpayment.broadcasted = True
-            onchainpayment.save(update_fields=["txid", "broadcasted"])
+            onchainpayment.save(update_fields=["status", "txid", "broadcasted"])
             onchainpayment.order_paid_TX.log(
                 f"TX OnchainPayment({onchainpayment.id},{response.txid}) in <b>mempool</b>"
             )
             return True
 
         elif onchainpayment.status == on_mempool_code:
-            # Bug, double payment attempted
+            # A previous successful SendCoins is already recorded in the DB (status=MEMPO).
+            # Status is only written to MEMPO after a confirmed broadcast, so reaching here
+            # means follow_invoices queued this payment again despite MEMPO status — log it.
             onchainpayment.order_paid_TX.log(
                 f"Attempted to re-broadcast OnchainPayment({onchainpayment.id},{onchainpayment}) already in mempool",
                 level="ERROR",

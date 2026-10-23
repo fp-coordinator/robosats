@@ -212,20 +212,20 @@ class CLNNode:
             time.sleep(3 + delay)
 
         if onchainpayment.status == queue_code:
-            # Changing the state to "MEMPO" should be atomic with SendCoins.
-            onchainpayment.status = on_mempool_code
-            onchainpayment.save(update_fields=["status"])
             nodestub = node_pb2_grpc.NodeStub(cls.node_channel)
             response = nodestub.Withdraw(request)
-
+            # RPC succeeded: write status, txid, and broadcasted in a single save.
+            # If Withdraw raised above, status stays QUEUE so follow_invoices'
+            # existing scanner retries naturally without any new retry logic here.
+            onchainpayment.status = on_mempool_code
             if response.txid:
                 onchainpayment.txid = response.txid.hex()
                 onchainpayment.broadcasted = True
-            onchainpayment.save(update_fields=["txid", "broadcasted"])
+            onchainpayment.save(update_fields=["status", "txid", "broadcasted"])
             return True
 
         elif onchainpayment.status == on_mempool_code:
-            # Bug, double payment attempted
+            # A previous successful Withdraw is already recorded in the DB (status=MEMPO).
             return True
 
     @classmethod
