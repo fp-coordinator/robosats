@@ -1,0 +1,10 @@
+FROM recksato/robosats@sha256:fc410360e9dfa897a5a8d6dc62935ff10a70e5f25c11f15ccc01461392c92b39
+
+COPY api/admin.py /usr/src/robosats/api/admin.py
+COPY api/lightning/cln.py /usr/src/robosats/api/lightning/cln.py
+COPY api/lightning/decoded.py /usr/src/robosats/api/lightning/decoded.py
+COPY api/lightning/lnd.py /usr/src/robosats/api/lightning/lnd.py
+COPY api/logics.py /usr/src/robosats/api/logics.py
+COPY api/management/commands/follow_invoices.py /usr/src/robosats/api/management/commands/follow_invoices.py
+COPY api/models/order.py /usr/src/robosats/api/models/order.py
+COPY api/views.py /usr/src/robosats/api/views.py
